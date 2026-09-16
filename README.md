@@ -1,4 +1,4 @@
-# Hostel Management – AI Face Verification System
+# Hostel Management ï¿½ AI Face Verification System
 
 A high-performance, Python-based **1:1 Face Verification System** designed specifically for hostel gate access and student attendance control.
 
@@ -21,23 +21,23 @@ This system compares a registered **Base Photo** against a live **Captured Photo
 
 ```text
 hostel_face_verification/
-¦
+ï¿½
 +-- app/
-¦   +-- __init__.py
-¦   +-- main.py             # FastAPI web application & POST /face/verify endpoint
-¦   +-- face_model.py       # ArcFace ONNX model loader & YuNet face detector
-¦   +-- face_service.py     # verify_face() logic, similarity & threshold evaluation
-¦
+ï¿½   +-- __init__.py
+ï¿½   +-- main.py             # FastAPI web application & POST /face/verify endpoint
+ï¿½   +-- face_model.py       # ArcFace ONNX model loader & YuNet face detector
+ï¿½   +-- face_service.py     # verify_face() logic, similarity & threshold evaluation
+ï¿½
 +-- models/
-¦   +-- download_models.py  # Automatic downloader for ONNX models
-¦   +-- arcface_model.onnx  # Pretrained ArcFace 512-d feature extractor (13.6 MB)
-¦   +-- face_detection_yunet.onnx # OpenCV YuNet CNN face detector (232 KB)
-¦
+ï¿½   +-- download_models.py  # Automatic downloader for ONNX models
+ï¿½   +-- arcface_model.onnx  # Pretrained ArcFace 512-d feature extractor (13.6 MB)
+ï¿½   +-- face_detection_yunet.onnx # OpenCV YuNet CNN face detector (232 KB)
+ï¿½
 +-- test_images/
-¦   +-- base/               # Test base registered photos
-¦   +-- capture/            # Test captured variations & negative controls
-¦   +-- setup_test_images.py# Downloads benchmark evaluation images
-¦
+ï¿½   +-- base/               # Test base registered photos
+ï¿½   +-- capture/            # Test captured variations & negative controls
+ï¿½   +-- setup_test_images.py# Downloads benchmark evaluation images
+ï¿½
 +-- test_verification.py    # Local test suite for Phase 8 (FAR/FRR evaluation)
 +-- test_api.py             # API endpoint automated test
 +-- requirements.txt        # Pinned Python dependencies
@@ -46,58 +46,30 @@ hostel_face_verification/
 
 ---
 
-## Exact Installation & Setup Commands
+## How to Run This Project (Step by Step)
 
-### Step 1: Clone or Navigate to the Project Folder
-```powershell
-cd C:\Users\ELCOT\.gemini\antigravity\scratch\hostel_face_verification
-```
+Step 1: Open a terminal (PowerShell) and navigate to the project folder. Command: cd "d:\Backend Projects\hostel-management-faceverification"
 
-### Step 2: Create and Activate Python Virtual Environment
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
+Step 2: Delete the old, broken virtual environment that came with the repo (it was built on a different computer). Command: Remove-Item -Recurse -Force venv
 
-### Step 3: Install Required Dependencies
-```powershell
-pip install -r requirements.txt
-```
+Step 3: Create a fresh virtual environment. Command: python -m venv venv
 
-### Step 4: Download Pretrained Models (YuNet & ArcFace)
-```powershell
-python models/download_models.py
-```
+Step 4: Activate the virtual environment. Command: .\venv\Scripts\Activate.ps1
+You should see (venv) appear at the start of your terminal prompt once it is active.
 
-### Step 5: (Optional) Setup Benchmark Test Images
-```powershell
-python test_images/setup_test_images.py
-```
+Step 5: Install the required dependencies. Command: pip install -r requirements.txt
 
----
+Step 6: Confirm the AI models are present. The models folder should already contain arcface_model.onnx and face_detection_yunet.onnx, so this step can be skipped. Only if either file is missing, run: python models/download_models.py
 
-## How to Run the System
+Step 7 (optional): Set up benchmark test images, only needed if you plan to run the local verification test suite. Command: python test_images/setup_test_images.py
 
-### 1. Run the Local Test Suite
-To test same-person, different-person, glasses, beard, lighting variations, and edge cases:
-```powershell
-python test_verification.py
-```
+Step 8: Start the FastAPI server. Command: uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
-### 2. Run the FastAPI Server
-To launch the backend API:
-```powershell
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
+Step 9: Open your web browser and go to the interactive Swagger docs. Address: http://127.0.0.1:8000/docs
+From there you can upload a base photo and a captured photo directly through the UI and test live verification.
 
-Server will start at: `http://127.0.0.1:8000`
-
-### 3. Open Interactive Swagger / OpenAPI Docs
-Visit in your web browser:
-```text
-http://127.0.0.1:8000/docs
-```
-You can upload photos directly through the UI and test live verification.
+Step 10 (optional): Instead of the server, you can run the automated test suites. For the local FAR/FRR evaluation, command: python test_verification.py
+To test a running API endpoint, command: python test_api.py or python test_phase4_5.py
 
 ---
 
