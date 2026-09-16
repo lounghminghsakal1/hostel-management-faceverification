@@ -31,6 +31,7 @@ class FaceDetectionDetails(BaseModel):
 class VerifyResponse(BaseModel):
     verified: bool = Field(description='True if both images belong to the same person, False otherwise')
     similarity_score: float = Field(description='Cosine similarity score between embeddings [-1.0 to 1.0]')
+    face_matching_percentage: float = Field(description='Face match percentage [0 to 100], derived from similarity_score')
     threshold: float = Field(description='Cosine similarity threshold applied')
     face_detected: FaceDetectionDetails
     message: str = Field(description='User-friendly result or diagnostic message')
@@ -110,6 +111,7 @@ async def api_verify_face(payload: VerifyRequest):
     return VerifyResponse(
         verified=result['verified'],
         similarity_score=result['similarity_score'],
+        face_matching_percentage=result['face_matching_percentage'],
         threshold=result['threshold'],
         face_detected=FaceDetectionDetails(
             base_image=result['face_detected']['base_image'],

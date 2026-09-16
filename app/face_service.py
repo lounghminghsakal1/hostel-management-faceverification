@@ -20,6 +20,15 @@ def compute_cosine_similarity(embedding_a: np.ndarray, embedding_b: np.ndarray) 
     similarity = max(-1.0, min(1.0, dot_product))
     return round(similarity, 4)
 
+def compute_face_matching_percentage(similarity_score: float) -> float:
+    """
+    Converts a cosine similarity score [-1.0, 1.0] into a human-friendly
+    match percentage [0, 100]. Non-positive scores map to 0%.
+    """
+    if similarity_score <= 0:
+        return 0.0
+    return round(min(similarity_score, 1.0) * 100, 2)
+
 def compute_euclidean_distance(embedding_a: np.ndarray, embedding_b: np.ndarray) -> float:
     """
     Computes Euclidean distance between two unit-normalized vectors:
@@ -65,6 +74,7 @@ def verify_face(
         return {
             "verified": False,
             "similarity_score": 0.0,
+            "face_matching_percentage": 0.0,
             "threshold": threshold,
             "face_detected": {"base_image": False, "capture_image": False},
             "message": f"Failed to load Base Image: {str(e)}"
@@ -77,6 +87,7 @@ def verify_face(
         return {
             "verified": False,
             "similarity_score": 0.0,
+            "face_matching_percentage": 0.0,
             "threshold": threshold,
             "face_detected": {"base_image": False, "capture_image": False},
             "message": f"Failed to load Captured Image: {str(e)}"
@@ -88,6 +99,7 @@ def verify_face(
         return {
             "verified": False,
             "similarity_score": 0.0,
+            "face_matching_percentage": 0.0,
             "threshold": threshold,
             "face_detected": {
                 "base_image": (base_det["count"] > 0),
@@ -102,6 +114,7 @@ def verify_face(
         return {
             "verified": False,
             "similarity_score": 0.0,
+            "face_matching_percentage": 0.0,
             "threshold": threshold,
             "face_detected": {
                 "base_image": True,
@@ -121,6 +134,7 @@ def verify_face(
         return {
             "verified": False,
             "similarity_score": 0.0,
+            "face_matching_percentage": 0.0,
             "threshold": threshold,
             "face_detected": {"base_image": True, "capture_image": True},
             "message": f"Feature extraction error: {str(e)}"
@@ -128,6 +142,7 @@ def verify_face(
 
     # Step 6: Calculate similarity comparison
     similarity_score = compute_cosine_similarity(emb_base, emb_cap)
+    face_matching_percentage = compute_face_matching_percentage(similarity_score)
 
     # Step 7: Apply configurable verification threshold
     is_verified = bool(similarity_score >= threshold)
@@ -141,6 +156,7 @@ def verify_face(
     return {
         "verified": is_verified,
         "similarity_score": similarity_score,
+        "face_matching_percentage": face_matching_percentage,
         "threshold": threshold,
         "face_detected": {
             "base_image": True,
