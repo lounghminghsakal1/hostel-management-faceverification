@@ -28,7 +28,7 @@ models/*.h5
 # ==========================================
 *.jpg
 *.jpeg
-*.png
+#*.png
 *.webp
 !test_images/base/*
 !test_images/capture/*
