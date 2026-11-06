@@ -75,107 +75,72 @@ To test a running API endpoint, command: python test_api.py or python test_phase
 
 ## API Documentation
 
-### `POST /face/verify`
+### `POST /face/verify` (JSON)
 
-Accepts both `base_image` and `capture_image` in a **single multipart form request**.
+The Node backend calls this with signed S3 URLs. Bind the server to `127.0.0.1` so only the backend can reach it.
 
-#### Request Parameters (Form Data):
+#### Request body
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `base_image` | File (`image/jpeg`, `image/png`) | Yes | Registered reference photo of the resident |
-| `capture_image` | File (`image/jpeg`, `image/png`) | Yes | Live camera capture at the hostel entrance |
-| `threshold` | Float | No (Default: `0.55`) | Cosine similarity threshold for verification |
+| `base_image` | string (URL) | Yes | The student's registered photo |
+| `captured_image` | string (URL) | Yes | Tonight's check-in selfie |
+| `reference_images` | string[] (URLs) | No | Recent check-in selfies that matched the registered photo well (the backend sends up to 3 from the last 30 days with 80%+). Helps when a beard, moustache or haircut has changed. |
+| `threshold` | float | No (default `0.32`) | Cosine similarity needed for `verified` (the 65% line) |
 
-#### Successful Verification Response (`200 OK`):
+#### Response (`200 OK`)
 ```json
 {
   "verified": true,
-  "similarity_score": 0.9315,
-  "threshold": 0.55,
-  "face_detected": {
-    "base_image": true,
-    "capture_image": true
-  },
+  "status": "VERIFIED",
+  "similarity_score": 0.703,
+  "base_similarity": 0.703,
+  "reference_similarity": null,
+  "matched_with": "base_photo",
+  "references_used": 0,
+  "face_matching_percentage": 100.0,
+  "threshold": 0.32,
+  "face_detected": { "base_image": true, "capture_image": true },
   "message": "Face verified successfully"
 }
 ```
 
-#### Impostor / Mismatch Response (`200 OK`):
-```json
-{
-  "verified": false,
-  "similarity_score": -0.0382,
-  "threshold": 0.55,
-  "face_detected": {
-    "base_image": true,
-    "capture_image": true
-  },
-  "message": "Face verification failed: low similarity score"
-}
-```
+`status` is one of:
 
-#### No Face Detected Response (`200 OK`):
-```json
-{
-  "verified": false,
-  "similarity_score": 0.0,
-  "threshold": 0.55,
-  "face_detected": {
-    "base_image": true,
-    "capture_image": false
-  },
-  "message": "Captured image issue: No face detected in the image. Please ensure the face is clearly visible."
-}
-```
+| Status | Meaning | What the backend does |
+|---|---|---|
+| `VERIFIED` / `NOT_VERIFIED` | Compared successfully | Saves the record with `face_matching_percentage` |
+| `NO_FACE_IN_CAPTURE`, `CAPTURED_IMAGE_UNREADABLE` | Selfie has no clear face | 422, the student retakes the selfie (nothing saved) |
+| `MULTIPLE_FACES_IN_CAPTURE` | Another person is clearly in the selfie | 422, retake with only the student in frame |
+| `NO_FACE_IN_BASE`, `MULTIPLE_FACES_IN_BASE`, `BASE_IMAGE_UNREADABLE` | The registered photo is unusable | 409, ask the hostel office for a new photo |
+| `PROCESSING_ERROR` | Unexpected model error | 503 |
 
-#### Multiple Faces Detected Response (`200 OK`):
-```json
-{
-  "verified": false,
-  "similarity_score": 0.0,
-  "threshold": 0.55,
-  "face_detected": {
-    "base_image": true,
-    "capture_image": true
-  },
-  "message": "Captured image issue: Multiple faces (2) detected in the image. Exactly one face must be present."
-}
-```
+A small face far behind the student (or a poster) is ignored: the largest face is used. "Multiple faces" means a second face at least half the size of the largest.
 
----
+### How the percentage is calculated
 
-## Frontend Integration (JavaScript `fetch` Example)
+1. **Detect** the largest face with YuNet (on a copy at most 1024 px, for speed).
+2. **Align** it to 112×112 with a least-squares similarity transform over all 5 landmarks (eyes, nose, mouth corners), as InsightFace does.
+3. **Embed** with ArcFace (`w600k_mbf`) in **RGB** order, averaging the face and its mirror image ("flip test"). The embedding is L2-normalised.
+4. **Compare** with cosine similarity against the registered photo (`base_similarity`).
+5. **Recent check-ins** (optional): the best similarity against the reference selfies can raise the score by at most **0.15** above `base_similarity`. The registered photo always anchors the result, so an impostor stays low even if one of their own selfies were used as a reference.
+6. **Calibrate** the cosine into the app's bands (cosine is not a percentage):
 
-The frontend web application or mobile app (React, React Native, Vue, Flutter, Vanilla JS) sends a single `FormData` request:
+| Cosine | Percentage | App colour |
+|---|---|---|
+| ≤ 0.05 | 0% | red |
+| 0.20 | 30% | below: red (likely someone else) |
+| 0.32 | 65% | below: yellow (check the photos); from here: green (trusted) |
+| ≥ 0.70 | 100% | green |
 
-```javascript
-async function verifyResident(baseImageFile, capturedBlob) {
-  const formData = new FormData();
-  formData.append('base_image', baseImageFile, 'base.jpg');
-  formData.append('capture_image', capturedBlob, 'capture.jpg');
-  formData.append('threshold', '0.55');
+The points are in `app/face_service.py` (`CALIBRATION_COSINE`, `CALIBRATION_PERCENT`). They follow InsightFace's guidance for these models (under 0.20 not the same person, 0.28+ the same person). Re-tune them once you have your own data (see below).
 
-  try {
-    const response = await fetch('http://127.0.0.1:8000/face/verify', {
-      method: 'POST',
-      body: formData,
-    });
+**Why it changed (v1.1):** before, the percentage was cosine × 100, so genuine matches typically showed 40–70% (below the 65% line). The model was also fed BGR instead of RGB, and RANSAC alignment could ignore a landmark. On the test photos the same person went from cosine 0.59 to 0.70–0.73 with the fixes, while different people stayed near 0. The endpoint now runs in a worker thread, so many students checking in at once don't queue behind each other.
 
-    const result = await response.json();
+### Tests
 
-    if (result.verified) {
-      console.log('? Entry Approved! Similarity:', result.similarity_score);
-      // Trigger hostel gate open / mark attendance
-      showAccessGrantedUI(result.similarity_score);
-    } else {
-      console.warn('? Entry Denied:', result.message);
-      // Display friendly error or ask student to look directly into camera
-      showAccessDeniedUI(result.message);
-    }
-  } catch (error) {
-    console.error('Network or server error:', error);
-  }
-}
+```bash
+python test_verification.py   # the original 6 scenarios
+python test_scoring.py        # calibration, reference cap, impostor checks
 ```
 
 ---
@@ -190,11 +155,11 @@ async function verifyResident(baseImageFile, capturedBlob) {
    $$\text{FRR} = \frac{\text{False Negatives}}{\text{Total Genuine Attempts}}$$
    Proportion of actual hostel residents who are incorrectly rejected. High FRR causes gate delays and inconvenience.
 
-3. **Configuring the Threshold**:
-   - Standard ArcFace models produce similarity $\approx 0.70 - 0.95$ for genuine matches and $< 0.30$ for different identities.
-   - **Default Threshold ($0.55$)**: Well-balanced for day-to-day hostel gate operations.
-   - **High Security Mode ($0.65$)**: Lower FAR, requires clearer lighting/alignment.
-   - **Lenient Mode ($0.45$)**: Lower FRR, helpful if entrance camera has lower resolution.
+3. **Tuning the calibration**:
+   - Collect 50-100 genuine pairs (a student's photo vs their own check-ins) and 50-100 impostor pairs.
+   - Look at the cosine values (`base_similarity` in the response) for both groups.
+   - Put the 30% point where impostors almost never reach, and the 65% point where genuine pairs almost always clear it.
+   - Update `CALIBRATION_COSINE` and `DEFAULT_VERIFICATION_THRESHOLD` (the 65% cosine) in `app/face_service.py`.
 
 ---
 

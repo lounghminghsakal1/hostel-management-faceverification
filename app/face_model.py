@@ -1,8 +1,9 @@
 import os
+import threading
 import cv2
 import numpy as np
 import onnxruntime as ort
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 # Standard reference 5-point facial coordinates for 112x112 ArcFace input
 REFERENCE_POINTS_112 = np.array([
@@ -13,16 +14,52 @@ REFERENCE_POINTS_112 = np.array([
     [70.7299, 92.2041]   # Subject's left mouth corner (Observer right)
 ], dtype=np.float32)
 
+# Faces are detected on a copy no larger than this (long side, px). Phone photos
+# can be 3000-4000 px; detection there is slow and not more accurate. Alignment
+# still uses the full-resolution image.
+DETECTION_MAX_SIDE = 1024
+
+# A second face at least this big (relative to the largest face's area) means
+# another person is clearly in the frame. Smaller faces (people far behind,
+# posters) are ignored and the largest face is used.
+SECOND_FACE_AREA_RATIO = 0.5
+
+
+def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """
+    Least-squares similarity transform (rotation, uniform scale, translation)
+    mapping src points onto dst points (Umeyama, 1991). Uses all 5 landmarks,
+    like InsightFace's own alignment, instead of RANSAC which can drop one.
+    Returns a 2x3 matrix for cv2.warpAffine.
+    """
+    src = src.astype(np.float64)
+    dst = dst.astype(np.float64)
+    n = src.shape[0]
+    src_mean, dst_mean = src.mean(axis=0), dst.mean(axis=0)
+    src_c, dst_c = src - src_mean, dst - dst_mean
+    cov = dst_c.T @ src_c / n
+    u, sigma, vt = np.linalg.svd(cov)
+    d = np.eye(2)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        d[1, 1] = -1
+    rotation = u @ d @ vt
+    src_var = (src_c ** 2).sum() / n
+    scale = (sigma * np.diag(d)).sum() / src_var if src_var > 0 else 1.0
+    translation = dst_mean - scale * rotation @ src_mean
+    return np.hstack([scale * rotation, translation[:, None]]).astype(np.float32)
+
+
 class FaceModel:
     """
     Handles Face Detection using OpenCV YuNet and
-    Face Feature Embedding generation using Pretrained ArcFace ONNX.
+    Face Feature Embedding generation using Pretrained ArcFace ONNX
+    (InsightFace w600k_mbf, from the buffalo_s pack).
     """
 
     def __init__(self, models_dir: Optional[str] = None):
         if models_dir is None:
             models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
-        
+
         self.models_dir = models_dir
         self.arcface_path = os.path.join(models_dir, "arcface_model.onnx")
         self.yunet_path = os.path.join(models_dir, "face_detection_yunet.onnx")
@@ -33,10 +70,10 @@ class FaceModel:
         if not os.path.exists(self.yunet_path):
             raise FileNotFoundError(f"YuNet model not found at {self.yunet_path}. Run models/download_models.py first.")
 
-        # Initialize ArcFace ONNX Session
+        # Initialize ArcFace ONNX Session (InferenceSession.run is thread-safe)
         opts = ort.SessionOptions()
-        opts.inter_op_num_threads = 4
-        opts.intra_op_num_threads = 4
+        opts.inter_op_num_threads = 2
+        opts.intra_op_num_threads = 2
         self.arcface_session = ort.InferenceSession(
             self.arcface_path,
             sess_options=opts,
@@ -45,8 +82,8 @@ class FaceModel:
         self.input_name = self.arcface_session.get_inputs()[0].name
         self.output_name = self.arcface_session.get_outputs()[0].name
 
-        # Initialize YuNet Face Detector
-        # Default placeholder size (320, 320), updated per input image
+        # Initialize YuNet Face Detector. It keeps per-call state (input size),
+        # so concurrent requests take turns through a lock.
         self.detector = cv2.FaceDetectorYN.create(
             model=self.yunet_path,
             config="",
@@ -55,6 +92,7 @@ class FaceModel:
             nms_threshold=0.3,
             top_k=5000
         )
+        self._detector_lock = threading.Lock()
         print("FaceModel initialized successfully: ArcFace ONNX & YuNet Detector loaded.")
 
     def decode_image(self, image_input: Any) -> np.ndarray:
@@ -78,14 +116,15 @@ class FaceModel:
                 try:
                     resp = requests.get(image_input, headers=headers, timeout=15)
                     if resp.status_code != 200:
-                        raise ValueError(f"HTTP {resp.status_code} while downloading image from: {image_input}")
+                        # Don't echo the URL: it's a signed S3 link
+                        raise ValueError(f"HTTP {resp.status_code} while downloading the image")
                     nparr = np.frombuffer(resp.content, np.uint8)
                     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     if img is None:
-                        raise ValueError(f"Failed to decode image downloaded from: {image_input}")
+                        raise ValueError("Downloaded file is not a valid image")
                     return img
                 except requests.RequestException as req_err:
-                    raise ValueError(f"Network error fetching image from {image_input}: {str(req_err)}")
+                    raise ValueError(f"Network error fetching image: {type(req_err).__name__}")
             if not os.path.exists(image_input):
                 raise FileNotFoundError(f"Image file not found: {image_input}")
             img = cv2.imread(image_input, cv2.IMREAD_COLOR)
@@ -97,18 +136,25 @@ class FaceModel:
 
     def detect_face(self, image_bgr: np.ndarray) -> Dict[str, Any]:
         """
-        Detects faces in the given BGR image using YuNet.
+        Detects faces in the given BGR image using YuNet and picks the largest one.
         Returns dict containing:
           - count: number of faces found
           - status: 'SUCCESS', 'NO_FACE_DETECTED', or 'MULTIPLE_FACES_DETECTED'
-          - bbox: [x, y, w, h] of best face (if found)
-          - landmarks: 5-point landmarks (if found)
+            (MULTIPLE only when a second face is nearly as big as the largest)
+          - bbox: [x, y, w, h] of the chosen face, in original image pixels
+          - landmarks: 5-point landmarks of the chosen face, in original image pixels
           - confidence: detection confidence score
         """
-        h, w, _ = image_bgr.shape
-        self.detector.setInputSize((w, h))
+        h, w = image_bgr.shape[:2]
+        scale = min(1.0, DETECTION_MAX_SIDE / float(max(h, w)))
+        small = image_bgr if scale == 1.0 else cv2.resize(
+            image_bgr, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA
+        )
+        sh, sw = small.shape[:2]
 
-        _, faces = self.detector.detect(image_bgr)
+        with self._detector_lock:
+            self.detector.setInputSize((sw, sh))
+            _, faces = self.detector.detect(small)
 
         if faces is None or len(faces) == 0:
             return {
@@ -117,8 +163,10 @@ class FaceModel:
                 "message": "No face detected in the image. Please ensure the face is clearly visible."
             }
 
+        faces = sorted(faces, key=lambda f: float(f[2] * f[3]), reverse=True)
         count = len(faces)
-        if count > 1:
+        largest_area = float(faces[0][2] * faces[0][3])
+        if count > 1 and float(faces[1][2] * faces[1][3]) >= SECOND_FACE_AREA_RATIO * largest_area:
             return {
                 "count": count,
                 "status": "MULTIPLE_FACES_DETECTED",
@@ -126,22 +174,16 @@ class FaceModel:
             }
 
         face_data = faces[0]
-        # Bounding box: [x, y, w, h]
-        bbox = [int(val) for val in face_data[0:4]]
+        inv = 1.0 / scale
+        bbox = [int(round(float(val) * inv)) for val in face_data[0:4]]
         confidence = float(face_data[14])
 
         # 5 facial landmarks:
         # [x_re, y_re], [x_le, y_le], [x_nt, y_nt], [x_rc, y_rc], [x_lc, y_lc]
-        landmarks = np.array([
-            [face_data[4], face_data[5]],   # Right eye (subject)
-            [face_data[6], face_data[7]],   # Left eye (subject)
-            [face_data[8], face_data[9]],   # Nose tip
-            [face_data[10], face_data[11]], # Right mouth corner
-            [face_data[12], face_data[13]]  # Left mouth corner
-        ], dtype=np.float32)
+        landmarks = np.array(face_data[4:14], dtype=np.float32).reshape(5, 2) * inv
 
         return {
-            "count": 1,
+            "count": count,
             "status": "SUCCESS",
             "bbox": bbox,
             "landmarks": landmarks,
@@ -151,44 +193,34 @@ class FaceModel:
 
     def align_and_crop_face(self, image_bgr: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
         """
-        Aligns and crops the face to 112x112 standard input using similarity transform
-        computed from the 5 facial landmarks.
+        Aligns and crops the face to the 112x112 ArcFace input using a
+        least-squares similarity transform over all 5 facial landmarks.
         """
-        # Estimate partial affine similarity matrix (rotation, translation, uniform scale)
-        M, _ = cv2.estimateAffinePartial2D(landmarks, REFERENCE_POINTS_112, method=cv2.RANSAC)
-
-        if M is None:
-            # Fallback if affine estimation fails: simple centered crop/resize
-            return cv2.resize(image_bgr, (112, 112), interpolation=cv2.INTER_AREA)
-
-        # Warp face into canonical 112x112 space
-        aligned_face = cv2.warpAffine(
+        M = similarity_transform(landmarks, REFERENCE_POINTS_112)
+        return cv2.warpAffine(
             image_bgr,
             M,
             (112, 112),
+            flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0)
         )
-        return aligned_face
+
+    def _embed_once(self, aligned_face_bgr: np.ndarray) -> np.ndarray:
+        # InsightFace models are trained on RGB input normalised as (x - 127.5) / 127.5
+        rgb = cv2.cvtColor(aligned_face_bgr, cv2.COLOR_BGR2RGB)
+        blob = (rgb.astype(np.float32) - 127.5) / 127.5
+        blob = np.transpose(blob, (2, 0, 1))[np.newaxis]  # (1, 3, 112, 112)
+        return self.arcface_session.run([self.output_name], {self.input_name: blob})[0][0]
 
     def generate_embedding(self, aligned_face_bgr: np.ndarray) -> np.ndarray:
         """
         Computes the 512-dimensional L2-normalized feature embedding from an aligned 112x112 face.
+        The embeddings of the face and its mirror image are averaged ("flip test"),
+        which makes the result steadier for selfies (front cameras may mirror)
+        and small head turns.
         """
-        # Preprocessing: convert to float32, normalize to [-1, 1]
-        # InsightFace MobileFaceNet / ArcFace expects BGR with (x - 127.5) / 127.5
-        face_blob = aligned_face_bgr.astype(np.float32)
-        face_blob = (face_blob - 127.5) / 127.5
-
-        # Transpose from HWC (112, 112, 3) to CHW (3, 112, 112)
-        face_blob = np.transpose(face_blob, (2, 0, 1))
-
-        # Add batch dimension: (1, 3, 112, 112)
-        face_blob = np.expand_dims(face_blob, axis=0)
-
-        # Run ONNX inference
-        outputs = self.arcface_session.run([self.output_name], {self.input_name: face_blob})
-        embedding = outputs[0][0]  # shape: (512,)
+        embedding = self._embed_once(aligned_face_bgr) + self._embed_once(cv2.flip(aligned_face_bgr, 1))
 
         # L2-normalization (unit hypersphere projection)
         norm = np.linalg.norm(embedding)
@@ -199,9 +231,12 @@ class FaceModel:
 
 # Global singleton instance for efficient reuse across API calls
 _global_face_model: Optional[FaceModel] = None
+_global_lock = threading.Lock()
 
 def get_face_model() -> FaceModel:
     global _global_face_model
     if _global_face_model is None:
-        _global_face_model = FaceModel()
+        with _global_lock:
+            if _global_face_model is None:
+                _global_face_model = FaceModel()
     return _global_face_model
