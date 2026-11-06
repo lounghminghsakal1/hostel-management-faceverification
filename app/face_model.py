@@ -3,7 +3,7 @@ import threading
 import cv2
 import numpy as np
 import onnxruntime as ort
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 # Standard reference 5-point facial coordinates for 112x112 ArcFace input
 REFERENCE_POINTS_112 = np.array([
@@ -23,6 +23,17 @@ DETECTION_MAX_SIDE = 1024
 # another person is clearly in the frame. Smaller faces (people far behind,
 # posters) are ignored and the largest face is used.
 SECOND_FACE_AREA_RATIO = 0.5
+
+# A face found with at least this confidence is taken as upright without
+# trying other orientations (rotated photos scored at most 0.89 in testing)
+UPRIGHT_CONFIDENCE = 0.93
+
+# Turns tried when the photo as it is isn't clearly upright
+ROTATIONS = (
+    (90, cv2.ROTATE_90_CLOCKWISE),
+    (270, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    (180, cv2.ROTATE_180),
+)
 
 
 def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
@@ -190,6 +201,36 @@ class FaceModel:
             "confidence": confidence,
             "message": "Single face detected successfully."
         }
+
+    def detect_face_upright(self, image_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any], int]:
+        """
+        Like detect_face, but handles sideways and upside-down photos.
+
+        YuNet often still "finds" a face in a rotated photo, with lower confidence
+        and landmarks placed as if the face were upright, which ruins alignment
+        (a genuine match then scores ~0%). In testing, the upright orientation
+        always had the highest confidence (0.91-0.95, rotated at most 0.89), so
+        unless the photo as-is is clearly upright, every orientation is tried
+        and the most confident one wins.
+
+        Returns (image the face was found in, detection, rotation in degrees clockwise).
+        """
+        detection = self.detect_face(image_bgr)
+        if detection["status"] == "MULTIPLE_FACES_DETECTED":
+            return image_bgr, detection, 0
+        if detection["status"] == "SUCCESS" and detection["confidence"] >= UPRIGHT_CONFIDENCE:
+            return image_bgr, detection, 0
+
+        best = (image_bgr, detection, 0)
+        for degrees, code in ROTATIONS:
+            rotated = cv2.rotate(image_bgr, code)
+            rotated_detection = self.detect_face(rotated)
+            if rotated_detection["status"] != "SUCCESS":
+                continue
+            best_detection = best[1]
+            if best_detection["status"] != "SUCCESS" or rotated_detection["confidence"] > best_detection["confidence"]:
+                best = (rotated, rotated_detection, degrees)
+        return best
 
     def align_and_crop_face(self, image_bgr: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
         """

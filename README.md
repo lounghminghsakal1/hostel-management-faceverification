@@ -75,6 +75,54 @@ To test a running API endpoint, command: python test_api.py or python test_phase
 
 ## API Documentation
 
+### `POST /face/check` (JSON): is this photo good enough?
+
+Used by the backend when a hostel admin uploads a student's photo (`POST /students/image_check`), and again when the student is saved. A poor photo on file makes every later check-in score low, so it's checked strictly.
+
+#### Request body
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `image` | string (URL) | Yes | The photo to check |
+| `purpose` | `"registration"` \| `"capture"` | No (default `registration`) | `registration`: strict, for a student photo on file. `capture`: the lenient rules check-in selfies get. |
+
+#### Response (`200 OK`)
+```json
+{
+  "ok": false,
+  "status": "REJECTED",
+  "message": "The face is turned to the side. Ask the student to look straight at the camera.",
+  "issues": [
+    { "code": "NOT_FACING_CAMERA", "severity": "error", "message": "The face is turned to the side. Ask the student to look straight at the camera." }
+  ],
+  "metrics": { "detection_confidence": 0.909, "inter_eye_px": 57.2, "yaw": 0.253, "pitch": 0.53, "roll": 6.7, "sharpness": 179.4, "brightness": 141.0, "...": "..." },
+  "purpose": "registration"
+}
+```
+
+`status` is `OK`, `OK_WITH_WARNINGS` (usable) or `REJECTED` (`ok: false`). Issues, errors first:
+
+| Code | Severity | Means |
+|---|---|---|
+| `IMAGE_UNREADABLE` | error | Not a JPG/PNG, or the download failed |
+| `NO_FACE` | error | No face found |
+| `MULTIPLE_FACES` | error | Another face at least half the size of the largest |
+| `PHOTO_SIDEWAYS` | error | The face is only upright when the photo is turned |
+| `LOW_RESOLUTION` | error | Shorter side under 300 px |
+| `FACE_TOO_SMALL` | error | Eyes under 55 px apart, or face under 18% of the photo width |
+| `FACE_CUT_OFF` | error | Part of the face is outside the photo |
+| `FACE_NOT_CLEAR` | error | The detector isn't confident it's a face (< 0.80) |
+| `NOT_FACING_CAMERA` | error | Head turned sideways |
+| `LOOKING_UP_OR_DOWN` | error | Head tilted up or down |
+| `BLURRY` | error | Out of focus (sharpness < 20) |
+| `TOO_DARK` / `TOO_BRIGHT` | error | Face brightness under 45 / over 225 (of 255) |
+| `SLIGHTLY_BLURRY` | warning | Sharpness 20-40 |
+| `HEAD_TILTED` | warning | Eye line tilted more than 15 degrees |
+| `LOW_CONTRAST` | warning | Washed out |
+| `UNEVEN_LIGHTING` | warning | One side of the face in shadow |
+| `FACE_NOT_CENTERED` | warning | Face far from the middle |
+
+The thresholds live in `app/face_quality.py` (`REGISTRATION`, `CAPTURE`). They were calibrated on the test photos and degraded copies of them (blurred, dark, overexposed, tiny, sideways).
+
 ### `POST /face/verify` (JSON)
 
 The Node backend calls this with signed S3 URLs. Bind the server to `127.0.0.1` so only the backend can reach it.
@@ -110,6 +158,7 @@ The Node backend calls this with signed S3 URLs. Bind the server to `127.0.0.1` 
 |---|---|---|
 | `VERIFIED` / `NOT_VERIFIED` | Compared successfully | Saves the record with `face_matching_percentage` |
 | `NO_FACE_IN_CAPTURE`, `CAPTURED_IMAGE_UNREADABLE` | Selfie has no clear face | 422, the student retakes the selfie (nothing saved) |
+| `LOW_QUALITY_CAPTURE` | Selfie far too dark, blurry, small or turned away to score reliably (lenient `capture` rules; `message` says what to fix) | 422 with that message, retake |
 | `MULTIPLE_FACES_IN_CAPTURE` | Another person is clearly in the selfie | 422, retake with only the student in frame |
 | `NO_FACE_IN_BASE`, `MULTIPLE_FACES_IN_BASE`, `BASE_IMAGE_UNREADABLE` | The registered photo is unusable | 409, ask the hostel office for a new photo |
 | `PROCESSING_ERROR` | Unexpected model error | 503 |
@@ -118,7 +167,7 @@ A small face far behind the student (or a poster) is ignored: the largest face i
 
 ### How the percentage is calculated
 
-1. **Detect** the largest face with YuNet (on a copy at most 1024 px, for speed).
+1. **Detect** the largest face with YuNet (on a copy at most 1024 px, for speed). If the face isn't clearly upright (confidence under 0.93), the photo is also tried turned 90/180/270 degrees and the most confident orientation is used. YuNet "finds" faces in rotated photos with wrong landmarks, which used to score a genuine sideways selfie at 0%.
 2. **Align** it to 112×112 with a least-squares similarity transform over all 5 landmarks (eyes, nose, mouth corners), as InsightFace does.
 3. **Embed** with ArcFace (`w600k_mbf`) in **RGB** order, averaging the face and its mirror image ("flip test"). The embedding is L2-normalised.
 4. **Compare** with cosine similarity against the registered photo (`base_similarity`).
@@ -130,7 +179,7 @@ A small face far behind the student (or a poster) is ignored: the largest face i
 | ≤ 0.05 | 0% | red |
 | 0.20 | 30% | below: red (likely someone else) |
 | 0.32 | 65% | below: yellow (check the photos); from here: green (trusted) |
-| ≥ 0.70 | 100% | green |
+| ≥ 0.80 | 100% | green (only near-identical photos; good matches land at 75-95%) |
 
 The points are in `app/face_service.py` (`CALIBRATION_COSINE`, `CALIBRATION_PERCENT`). They follow InsightFace's guidance for these models (under 0.20 not the same person, 0.28+ the same person). Re-tune them once you have your own data (see below).
 
@@ -141,6 +190,7 @@ The points are in `app/face_service.py` (`CALIBRATION_COSINE`, `CALIBRATION_PERC
 ```bash
 python test_verification.py   # the original 6 scenarios
 python test_scoring.py        # calibration, reference cap, impostor checks
+python test_quality.py        # photo checks, selfie retakes, sideways photos
 ```
 
 ---

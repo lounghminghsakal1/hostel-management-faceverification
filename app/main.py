@@ -1,17 +1,17 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 import uvicorn
 
-from app.face_service import verify_face, DEFAULT_VERIFICATION_THRESHOLD, MAX_REFERENCE_IMAGES
+from app.face_service import verify_face, check_face_photo, DEFAULT_VERIFICATION_THRESHOLD, MAX_REFERENCE_IMAGES
 from app.face_model import get_face_model
 
 # Initialize FastAPI application
 app = FastAPI(
     title='Hostel Management - Face Verification API',
     description='Production-ready ArcFace Biometric Face Verification System for Hostel Access Control.',
-    version='1.1.0'
+    version='1.2.0'
 )
 
 # Configure CORS for seamless frontend web & mobile integration
@@ -28,6 +28,11 @@ class FaceDetectionDetails(BaseModel):
     base_image: bool = Field(description='Whether a single face was detected in base image')
     capture_image: bool = Field(description='Whether a single face was detected in captured image')
 
+class PhotoIssue(BaseModel):
+    code: str = Field(description='Machine-readable problem, e.g. BLURRY, NO_FACE, NOT_FACING_CAMERA')
+    severity: Literal['error', 'warning'] = Field(description='error: the photo should not be used; warning: usable but not ideal')
+    message: str = Field(description='Plain message to show the user')
+
 class VerifyResponse(BaseModel):
     verified: bool = Field(description='True if both images belong to the same person, False otherwise')
     status: str = Field(description='VERIFIED, NOT_VERIFIED, or why it could not be checked (e.g. NO_FACE_IN_CAPTURE)')
@@ -39,7 +44,23 @@ class VerifyResponse(BaseModel):
     face_matching_percentage: float = Field(description='Calibrated match percentage [0 to 100]: 65+ trusted, 30-65 check, below 30 likely someone else')
     threshold: float = Field(description='Cosine similarity threshold applied for `verified`')
     face_detected: FaceDetectionDetails
+    issues: List[PhotoIssue] = Field(default_factory=list, description='For LOW_QUALITY_CAPTURE: what is wrong with the selfie')
     message: str = Field(description='User-friendly result or diagnostic message')
+
+class CheckRequest(BaseModel):
+    image: str = Field(..., description='Public or accessible URL of the photo to check')
+    purpose: Literal['registration', 'capture'] = Field(
+        default='registration',
+        description='registration: strict check for a student photo on file; capture: the lenient rules check-in selfies get',
+    )
+
+class CheckResponse(BaseModel):
+    ok: bool = Field(description='False when any issue is an error: the photo should not be used')
+    status: Literal['OK', 'OK_WITH_WARNINGS', 'REJECTED']
+    message: str = Field(description='The most important issue, or "The photo looks good."')
+    issues: List[PhotoIssue] = Field(description='Errors first, then warnings')
+    metrics: Dict[str, Any] = Field(description='Measured values: face size, pose (yaw/pitch/roll), sharpness, brightness, ...')
+    purpose: str
 
 class HealthResponse(BaseModel):
     status: str
@@ -69,7 +90,7 @@ def health_check():
     return HealthResponse(
         status='healthy',
         model_loaded=(model is not None),
-        version='1.1.0'
+        version='1.2.0'
     )
 
 class VerifyRequest(BaseModel):
@@ -105,6 +126,23 @@ def api_verify_face(payload: VerifyRequest):
         reference_images=payload.reference_images,
     )
     return VerifyResponse(**result)
+
+@app.post('/face/check', response_model=CheckResponse, tags=['Face Verification'])
+def api_check_face_photo(payload: CheckRequest):
+    """
+    Photo quality check, for a student's photo before it's saved.
+
+    {
+        "image": "https://example.com/new_student_photo.jpg",
+        "purpose": "registration"
+    }
+
+    Checks for exactly one clear face that is big enough, inside the frame,
+    upright, facing the camera, in focus and well lit. Returns `ok: false` with
+    the reasons when the photo shouldn't be used (e.g. NO_FACE, BLURRY, TOO_DARK,
+    NOT_FACING_CAMERA), or warnings for photos that work but aren't ideal.
+    """
+    return CheckResponse(**check_face_photo(payload.image, payload.purpose))
 
 if __name__ == '__main__':
     # Bind to localhost: only the Node backend on the same machine should call this

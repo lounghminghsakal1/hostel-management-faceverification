@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
 from app.face_model import get_face_model, FaceModel
+from app import face_quality
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -17,9 +18,9 @@ from app.face_model import get_face_model, FaceModel
 #   cosine <= 0.05 ->   0%
 #   cosine    0.20 ->  30%   (below: red, likely someone else)
 #   cosine    0.32 ->  65%   (below: yellow, check the photos; from here: green, trusted)
-#   cosine >= 0.70 -> 100%
+#   cosine >= 0.80 -> 100%   (only near-identical photos; typical good matches land at 75-95%)
 # Tune these points if your own data shows a different spread.
-CALIBRATION_COSINE = (0.05, 0.20, 0.32, 0.70)
+CALIBRATION_COSINE = (0.05, 0.20, 0.32, 0.80)
 CALIBRATION_PERCENT = (0.0, 30.0, 65.0, 100.0)
 
 # Cosine similarity needed for "verified" (the 65% line above)
@@ -70,8 +71,10 @@ def compute_euclidean_distance(embedding_a: np.ndarray, embedding_b: np.ndarray)
     return round(dist, 4)
 
 
-def _failure(status: str, message: str, threshold: float, base_face: bool = False, capture_face: bool = False) -> Dict[str, Any]:
+def _failure(status: str, message: str, threshold: float, base_face: bool = False, capture_face: bool = False,
+             issues: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     return {
+        "issues": issues or [],
         "verified": False,
         "status": status,
         "similarity_score": 0.0,
@@ -126,6 +129,7 @@ def verify_face(
         VERIFIED, NOT_VERIFIED,
         BASE_IMAGE_UNREADABLE, NO_FACE_IN_BASE, MULTIPLE_FACES_IN_BASE,
         CAPTURED_IMAGE_UNREADABLE, NO_FACE_IN_CAPTURE, MULTIPLE_FACES_IN_CAPTURE,
+        LOW_QUALITY_CAPTURE (message says what to fix; details in `issues`),
         PROCESSING_ERROR
     """
     model: FaceModel = get_face_model()
@@ -144,17 +148,23 @@ def verify_face(
     if capture_img_bgr is None:
         return _failure("CAPTURED_IMAGE_UNREADABLE", f"Failed to load Captured Image: {capture_error}", threshold)
 
-    # Step 2: Detect faces in Base Image
-    base_det = model.detect_face(base_img_bgr)
+    # Step 2: Detect faces in Base Image (a sideways photo is turned upright)
+    base_img_bgr, base_det, _ = model.detect_face_upright(base_img_bgr)
     if base_det["status"] != "SUCCESS":
         status = "MULTIPLE_FACES_IN_BASE" if base_det["status"] == "MULTIPLE_FACES_DETECTED" else "NO_FACE_IN_BASE"
         return _failure(status, f"Base image issue: {base_det['message']}", threshold, base_face=base_det["count"] > 0)
 
     # Step 3: Detect faces in Captured Image
-    cap_det = model.detect_face(capture_img_bgr)
+    capture_img_bgr, cap_det, _ = model.detect_face_upright(capture_img_bgr)
     if cap_det["status"] != "SUCCESS":
         status = "MULTIPLE_FACES_IN_CAPTURE" if cap_det["status"] == "MULTIPLE_FACES_DETECTED" else "NO_FACE_IN_CAPTURE"
         return _failure(status, f"Captured image issue: {cap_det['message']}", threshold, base_face=True, capture_face=cap_det["count"] > 0)
+
+    # Step 3b: A selfie too dark, blurry, far away or turned away gives an unreliable
+    # score, so ask for a retake instead (lenient: only extreme cases)
+    capture_issues = [i for i in face_quality.assess(capture_img_bgr, cap_det, "capture")["issues"] if i["severity"] == "error"]
+    if capture_issues:
+        return _failure("LOW_QUALITY_CAPTURE", capture_issues[0]["message"], threshold, base_face=True, capture_face=True, issues=capture_issues)
 
     # Step 4: Align faces & generate 512-dimensional ArcFace embeddings
     try:
@@ -172,7 +182,7 @@ def verify_face(
         ref_bgr, _ = job.result()
         if ref_bgr is None:
             continue
-        ref_det = model.detect_face(ref_bgr)
+        ref_bgr, ref_det, _ = model.detect_face_upright(ref_bgr)
         if ref_det["status"] != "SUCCESS":
             continue
         try:
@@ -197,6 +207,7 @@ def verify_face(
 
     # Step 8: Return structured result
     return {
+        "issues": [],
         "verified": is_verified,
         "status": "VERIFIED" if is_verified else "NOT_VERIFIED",
         "similarity_score": similarity_score,
@@ -212,3 +223,45 @@ def verify_face(
         },
         "message": message
     }
+
+
+def check_face_photo(image: Any, purpose: str = "registration") -> Dict[str, Any]:
+    """
+    Checks one photo before it's used: exactly one clear, sharp, well-lit,
+    front-facing face, big enough and inside the frame.
+
+    purpose: "registration" (strict, for the student's photo on file) or
+             "capture" (lenient, the same rules check-in selfies get).
+
+    Returns {ok, status, message, issues, metrics, purpose}:
+        ok      - False when any issue is an error (the photo shouldn't be used)
+        status  - OK, OK_WITH_WARNINGS or REJECTED
+        issues  - [{code, severity: "error" | "warning", message}], most important first
+        metrics - the measured values (face size, pose, sharpness, brightness, ...)
+    """
+    model: FaceModel = get_face_model()
+    image_bgr, error = _try_decode(model, image)
+    if image_bgr is None:
+        issues = [face_quality.issue("IMAGE_UNREADABLE")]
+        return {**face_quality.summarize(issues), "issues": issues, "metrics": {"error": error}, "purpose": purpose}
+
+    upright, detection, rotation = model.detect_face_upright(image_bgr)
+    metrics: Dict[str, Any] = {"image_width": image_bgr.shape[1], "image_height": image_bgr.shape[0], "rotation": rotation}
+
+    if detection["status"] == "NO_FACE_DETECTED":
+        issues = [face_quality.issue("NO_FACE")]
+        if min(image_bgr.shape[:2]) < face_quality.THRESHOLDS[purpose].min_image_side:
+            issues.append(face_quality.issue("LOW_RESOLUTION"))
+    elif detection["status"] == "MULTIPLE_FACES_DETECTED":
+        issues = [face_quality.issue("MULTIPLE_FACES")]
+        metrics["face_count"] = detection["count"]
+    else:
+        quality = face_quality.assess(upright, detection, purpose)
+        issues = quality["issues"]
+        metrics.update(quality["metrics"])
+        if rotation and purpose == "registration":
+            issues.insert(0, face_quality.issue("PHOTO_SIDEWAYS"))
+
+    # errors first, then warnings
+    issues.sort(key=lambda i: 0 if i["severity"] == "error" else 1)
+    return {**face_quality.summarize(issues), "issues": issues, "metrics": metrics, "purpose": purpose}
